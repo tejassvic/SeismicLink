@@ -1,0 +1,87 @@
+services:
+  db:
+    image: postgres:15-alpine
+    container_name: seismolink-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME:-seismo}
+      POSTGRES_USER: ${DB_USER:-seismo}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-change-me-before-deploy}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-seismo} -d ${DB_NAME:-seismo}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [seismo]
+
+  backend:
+    build: ./restapi
+    container_name: seismolink-backend
+    restart: unless-stopped
+    environment:
+      DB_NAME: ${DB_NAME:-seismo}
+      DB_USER: ${DB_USER:-seismo}
+      DB_PASSWORD: ${DB_PASSWORD:-change-me-before-deploy}
+      DB_HOST: db
+      DB_PORT: 5432
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-ChangeMe123!}
+      JWT_SECRET: ${JWT_SECRET:-replace-this-secret-before-deployment}
+      OFFLINE_SECONDS: ${OFFLINE_SECONDS:-5}
+      WAVEFORM_DIR: /data/waveforms
+      SEED_DEMO_NODES: ${SEED_DEMO_NODES:-true}
+      CORS_ORIGINS: ${CORS_ORIGINS:-*}
+    volumes:
+      - waveform_data:/data/waveforms
+    ports:
+      - "9001:9001"
+    depends_on:
+      db:
+        condition: service_healthy
+    command: ["uvicorn", "main:socket_app", "--host", "0.0.0.0", "--port", "9001"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9001/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks: [seismo]
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_URL: ""
+        VITE_SOCKET_URL: ""
+    container_name: seismolink-frontend
+    restart: unless-stopped
+    ports:
+      - "9000:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks: [seismo]
+
+  simulator:
+    build: ./simulator
+    container_name: seismolink-simulator
+    profiles: [demo]
+    environment:
+      SOCKET_URL: http://backend:9001
+      SIM_SPEED: ${SIM_SPEED:-20}
+      SIM_SAMPLE_COUNT: ${SIM_SAMPLE_COUNT:-7000}
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks: [seismo]
+    restart: "no"
+
+volumes:
+  pgdata:
+  waveform_data:
+
+networks:
+  seismo:
+    driver: bridge

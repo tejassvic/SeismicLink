@@ -1,0 +1,1 @@
+"""SeismoLink application services."""
