@@ -51,7 +51,7 @@ async def lifespan(app: FastAPI):
             ]
             for mid, name, lat, lon in demo_nodes:
                 await conn.execute("""INSERT INTO nodes(module_id,name,latitude,longitude,location_description,auth_key,source)
-                VALUES($1,$2,$3,$4,'Sample demonstration coordinates', $5, 'simulated') ON CONFLICT(module_id) DO NOTHING""", mid, name, lat, lon, os.getenv(f'SIM_NODE_{mid}_KEY') or secrets.token_urlsafe(32))
+                VALUES($1,$2,$3,$4,'Sample demonstration coordinates', $5, 'simulated') ON CONFLICT(module_id) DO UPDATE SET name=EXCLUDED.name,latitude=EXCLUDED.latitude,longitude=EXCLUDED.longitude,location_description=EXCLUDED.location_description,source='simulated'""", mid, name, lat, lon, os.getenv(f'SIM_NODE_{mid}_KEY') or secrets.token_urlsafe(32))
     monitor_task = asyncio.create_task(offline_monitor())
     try:
         yield
@@ -170,11 +170,12 @@ async def system_logs(limit: int = Query(100,ge=1,le=500)):
     async with db.acquire() as conn: rows = await conn.fetch('SELECT * FROM system_logs ORDER BY created_at DESC LIMIT $1',limit)
     return {'logs':[dict(r) for r in rows]}
 
-async def fetch_infrastructure(event: dict, radius_km: float | None):
-    # Fetch mapped critical facilities around an estimated epicenter.
+async def fetch_infrastructure(event: dict, radius_km: float | None, center: tuple[float, float] | None = None):
+    # Fetch mapped facilities around a scientifically-unverified search center.
+    # The caller labels whether the center is an estimated epicenter or a station.
     analysis = json_value(event.get('analysis')) or {}
-    lat = analysis.get('epicenter_latitude')
-    lon = analysis.get('epicenter_longitude')
+    lat = center[0] if center else analysis.get('epicenter_latitude')
+    lon = center[1] if center else analysis.get('epicenter_longitude')
     if lat is None or lon is None:
         return []
 
@@ -206,9 +207,8 @@ async def fetch_infrastructure(event: dict, radius_km: float | None):
         a = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
         return 6371.0 * 2 * math.asin(math.sqrt(min(1.0, a))) <= radius_km
 
-    if cached:
-        return [{**dict(row), 'tags': json_value(row['tags'])}
-                for row in cached if within_radius(row['latitude'], row['longitude'])]
+    cached_items = [{**dict(row), 'tags': json_value(row['tags'])}
+                    for row in cached if within_radius(row['latitude'], row['longitude'])]
 
     query = f'''[out:json][timeout:40];
     (
@@ -245,6 +245,8 @@ async def fetch_infrastructure(event: dict, radius_km: float | None):
             last_error = exc
 
     if elements is None:
+        if cached_items:
+            return cached_items
         raise HTTPException(502, f'OpenStreetMap Overpass lookup failed on the available servers: {last_error}')
 
     items = []
@@ -310,34 +312,47 @@ async def fetch_infrastructure(event: dict, radius_km: float | None):
                     tags=EXCLUDED.tags,fetched_at=NOW()
                 ''', item['osm_id'], item['name'], item['category'], item['amenity_type'],
                      item['latitude'], item['longitude'], json.dumps(item['tags']))
-    return items
+    # A successful empty Overpass response should not discard previously cached
+    # mapped features for this area.
+    return items if items else cached_items
 
 
 @api.get('/api/v1/events/{event_id}/infrastructure')
 async def event_infrastructure(event_id: str, radius_km: float | None = Query(None, gt=0, le=50)):
     async with db.acquire() as conn:
-        row = await conn.fetchrow('SELECT * FROM seismic_events WHERE id=$1::uuid', event_id)
+        row = await conn.fetchrow('''
+            SELECT e.*, n.latitude AS node_latitude, n.longitude AS node_longitude,
+                   n.name AS node_name
+            FROM seismic_events e JOIN nodes n USING(module_id)
+            WHERE e.id=$1::uuid
+        ''', event_id)
     if not row:
         raise HTTPException(404, 'Event not found')
 
     event = dict(row)
     analysis = json_value(event.get('analysis')) or {}
-    lat = analysis.get('epicenter_latitude')
-    lon = analysis.get('epicenter_longitude')
+    epicenter_lat = analysis.get('epicenter_latitude')
+    epicenter_lon = analysis.get('epicenter_longitude')
 
-    # Missing location is a valid pending state, not an HTTP conflict.
-    if lat is None or lon is None:
+    # A single station cannot locate an earthquake epicenter. However, if its
+    # registered coordinates are known, we can still show nearby OSM facilities
+    # around the station, explicitly labelled as station proximity.
+    if epicenter_lat is not None and epicenter_lon is not None:
+        center = (float(epicenter_lat), float(epicenter_lon))
+        center_source = 'estimated_epicenter'
+        status = 'ready'
+    elif event.get('node_latitude') is not None and event.get('node_longitude') is not None:
+        center = (float(event['node_latitude']), float(event['node_longitude']))
+        center_source = 'station_location'
+        status = 'station_proximity'
+    else:
         return {
-            'event_id': event_id,
-            'available': False,
-            'status': 'pending',
-            'reason': 'Epicenter estimation is pending. At least three associated stations with coordinates and arrival-time information are needed for a preliminary 2D estimate.',
-            'epicenter': None,
-            'radius_km': None,
-            'radius_source': None,
-            'infrastructure_count': 0,
-            'infrastructure': [],
-            'interpretation': 'Infrastructure lookup is unavailable until an epicenter has been estimated; no location is being guessed.',
+            'event_id': event_id, 'available': False, 'status': 'pending',
+            'reason': 'This station has no registered coordinates. Register the physical node latitude and longitude in the Nodes/Admin panel. An epicenter cannot be estimated from one station.',
+            'epicenter': None, 'search_center': None, 'center_source': None,
+            'radius_km': None, 'radius_source': None,
+            'infrastructure_count': 0, 'infrastructure': [],
+            'interpretation': 'No location was guessed. Register station coordinates or associate detections from at least three suitably placed stations.'
         }
 
     estimated_radius = analysis.get('affected_radius_km')
@@ -352,17 +367,19 @@ async def event_infrastructure(event_id: str, radius_km: float | None = Query(No
         radius_source = 'default_search_radius'
 
     search_radius = min(max(float(search_radius), 0.5), 50.0)
-    items = await fetch_infrastructure(event, search_radius)
+    items = await fetch_infrastructure(event, search_radius, center=center)
     return {
-        'event_id': event_id,
-        'available': True,
-        'status': 'ready',
-        'epicenter': {'latitude': float(lat), 'longitude': float(lon)},
-        'radius_km': search_radius,
-        'radius_source': radius_source,
-        'infrastructure_count': len(items),
-        'infrastructure': items,
-        'interpretation': 'Mapped infrastructure within the selected proximity-search radius. Proximity does not establish damage or shaking intensity.',
+        'event_id': event_id, 'available': True, 'status': status,
+        'epicenter': ({'latitude': center[0], 'longitude': center[1]} if center_source == 'estimated_epicenter' else None),
+        'search_center': {'latitude': center[0], 'longitude': center[1]},
+        'center_source': center_source,
+        'radius_km': search_radius, 'radius_source': radius_source,
+        'infrastructure_count': len(items), 'infrastructure': items,
+        'interpretation': (
+            'Mapped infrastructure near the estimated epicenter. Proximity does not establish damage or shaking intensity.'
+            if center_source == 'estimated_epicenter' else
+            'Mapped infrastructure near this sensor station only. This is not an earthquake epicenter, impact area, or damage assessment.'
+        )
     }
 
 async def broadcast_nodes():
