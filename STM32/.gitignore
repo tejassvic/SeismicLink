@@ -1,0 +1,55 @@
+
+# ==========================================
+# STM32CubeIDE / Eclipse
+# ==========================================
+
+.metadata/
+.settings/
+*.launch
+*.log
+
+# Build outputs
+Debug/
+Release/
+build/
+*.elf
+*.hex
+*.bin
+*.map
+*.list
+*.cyclo
+*.su
+*.o
+*.d
+*.a
+
+# Generated IDE files
+*.mk
+makefile
+objects.list
+sources.list
+
+# ==========================================
+# STM32CubeIDE temporary files
+# ==========================================
+
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ==========================================
+# Debugging
+# ==========================================
+
+*.jlink
+*.stlink
+*.svd
+
+# ==========================================
+# Backup files
+# ==========================================
+
+*~
+*.bak
+*.tmp
+*.orig
