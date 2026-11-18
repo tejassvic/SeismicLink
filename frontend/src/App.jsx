@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { MapContainer, TileLayer, Marker, Circle, Popup, useMap } from 'react-leaflet'
 import { io } from 'socket.io-client'
 import L from 'leaflet'
@@ -9,17 +9,42 @@ import CapSimulation from './pages/CapSimulation.jsx'
 const API = import.meta.env.VITE_API_URL || ''
 const SOCKET = import.meta.env.VITE_SOCKET_URL || API || window.location.origin
 const icon = (status) => L.divIcon({className:'node-div-icon',html:`<span class="node-dot ${status}"></span>`,iconSize:[22,22],iconAnchor:[11,11]})
-const infraIcon = L.divIcon({className:'infra-div-icon',html:'<span>✚</span>',iconSize:[24,24],iconAnchor:[12,12]})
+const infraIcon = (category) => {
+  const icons = {healthcare:'🏥',education:'🎓',emergency:'🚨',shelter:'🏠',power:'⚡',water_utility:'💧',telecom:'📡',bridge:'🌉',road:'🛣️',rail:'🚉',airport:'✈️'}
+  const colors = {healthcare:'#dc2626',education:'#2563eb',emergency:'#ea580c',shelter:'#16a34a',power:'#ca8a04',water_utility:'#0891b2',telecom:'#7c3aed',bridge:'#7c3aed',road:'#64748b',rail:'#475569',airport:'#0f766e'}
+  const color = colors[category] || '#64748b'
+  return L.divIcon({className:'infra-div-icon',html:`<span style="background:${color};border:2px solid white;border-radius:50%;width:26px;height:26px;display:flex;align-items:center;justify-content:center;font-size:14px;box-shadow:0 1px 6px #0006">${icons[category]||'📍'}</span>`,iconSize:[26,26],iconAnchor:[13,13]})
+}
 const fmt = (v) => v ? new Date(v).toLocaleString() : '—'
 
-function FitBounds({nodes, epicenter}) {
+function FitBounds({nodes, epicenter, infrastructure = [], fitKey = 'initial'}) {
   const map = useMap()
+  const lastFitKeyRef = useRef(null)
+
   useEffect(() => {
-    const pts = nodes.filter(n=>n.latitude!=null&&n.longitude!=null).map(n=>[n.latitude,n.longitude])
-    if (epicenter) pts.push([epicenter.latitude,epicenter.longitude])
-    if (pts.length>1) map.fitBounds(pts,{padding:[40,40],maxZoom:12})
-    else if (pts.length===1) map.setView(pts[0],11)
-  },[nodes,epicenter,map])
+    // Live node snapshots arrive repeatedly. Do not call fitBounds on every
+    // snapshot: doing so overrides manual zoom and pan gestures.
+    if (lastFitKeyRef.current === fitKey) return
+
+    const pts = nodes
+      .filter(n => n.latitude != null && n.longitude != null)
+      .map(n => [Number(n.latitude), Number(n.longitude)])
+
+    if (epicenter) pts.push([Number(epicenter.latitude), Number(epicenter.longitude)])
+    infrastructure.forEach(item => {
+      if (item.latitude != null && item.longitude != null) {
+        pts.push([Number(item.latitude), Number(item.longitude)])
+      }
+    })
+
+    // Wait for initial node coordinates rather than locking in an empty map.
+    if (pts.length === 0) return
+
+    lastFitKeyRef.current = fitKey
+    if (pts.length > 1) map.fitBounds(pts, { padding: [40, 40], maxZoom: 12 })
+    else map.setView(pts[0], 11)
+  }, [fitKey, map, nodes, epicenter, infrastructure])
+
   return null
 }
 
@@ -84,7 +109,10 @@ export default function App(){
     const timer=setInterval(loadSelectedDetail,5000)
     return()=>{live=false;clearInterval(timer)}
   },[selected])
-  useEffect(()=>{if(!selected||!detail)return;let live=true;setInfraLoading(true);fetch(`${API}/api/v1/events/${selected}/infrastructure`).then(r=>r.ok?r.json():null).then(d=>{if(live)setInfrastructure(d?.infrastructure||[])}).catch(()=>{if(live)setInfrastructure([])}).finally(()=>{if(live)setInfraLoading(false)});return()=>{live=false}},[selected,detail?.id])
+  const [infraError,setInfraError]=useState('')
+  const [infraRadius,setInfraRadius]=useState(null)
+  const [infraCategory,setInfraCategory]=useState('all')
+  useEffect(()=>{let cancelled=false;if(!selected||!detail){setInfrastructure([]);setInfraError('');return}setInfraLoading(true);setInfraError('');fetch(`${API}/api/v1/events/${selected}/infrastructure`).then(async response=>{const payload=await response.json().catch(()=>({}));if(!response.ok)throw new Error(payload.detail||`Infrastructure request failed (${response.status})`);if(!cancelled){setInfrastructure(payload.infrastructure||[]);setInfraRadius(payload.radius_km??null)}}).catch(error=>{if(!cancelled){setInfrastructure([]);setInfraError(error.message||'Could not load OpenStreetMap infrastructure')}}).finally(()=>{if(!cancelled)setInfraLoading(false)});return()=>{cancelled=true}},[selected,detail?.id])
   const active=nodes.filter(n=>n.status==='event').length,online=nodes.filter(n=>n.status==='online').length
   const selectedEvent=events.find(e=>String(e.id)===String(selected))
   const selectedAnalysis=detail?.analysis||selectedEvent?.analysis||{}
@@ -97,15 +125,21 @@ export default function App(){
     <header className="topbar"><div className="brand"><div className="brand-mark">S</div><div><strong>SEISMOLINK</strong><span>LIVE SEISMIC MONITORING</span></div></div><div className="top-status"><span className={`status-light ${socketState==='live'?'ok':'warn'}`}/>{socketState==='live'?'LIVE CONNECTION':'RECONNECTING'}<span className="top-divider"/> <span className="muted">API · PostgreSQL</span></div><nav className="main-nav"><button className={activeTab==='overview'?'active':''} onClick={()=>setActiveTab('overview')}>Overview</button><button className={activeTab==='cap'?'active':''} onClick={()=>setActiveTab('cap')}>CAP Simulation</button></nav><button className="admin-btn" onClick={()=>setAdminOpen(true)}>⚙ Admin</button></header>
     {activeTab==='cap' ? <CapSimulation /> : <main className="workspace"><section className="map-column"><div className="page-heading"><div><div className="eyebrow">NETWORK OVERVIEW</div><h1>Seismic monitoring map</h1><p>Live node telemetry, event detections and event-specific impact analysis.</p></div><div className="map-legend"><span><i className="legend-dot online"/>Online</span><span><i className="legend-dot event"/>Event</span><span><i className="legend-dot offline"/>Offline</span></div></div>
       <div className="stats-row"><div className="stat-card"><span>REGISTERED NODES</span><strong>{nodes.length}</strong><small>Physical + simulated</small></div><div className="stat-card"><span>ONLINE</span><strong className="green-text">{online}</strong><small>Heartbeat within threshold</small></div><div className="stat-card"><span>ACTIVE EVENTS</span><strong className="red-text">{active}</strong><small>Live waveform capture</small></div><div className="stat-card"><span>RECORDED EVENTS</span><strong>{events.length}</strong><small>Stored on server</small></div></div>
-      <div className="map-card"><div className="map-toolbar"><div><strong>NODE NETWORK</strong><span>OpenStreetMap · Leaflet</span></div><button className="subtle-btn" onClick={refresh}>↻ Refresh</button></div><MapContainer center={center} zoom={11} scrollWheelZoom className="main-map"><TileLayer attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>' url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"/><FitBounds nodes={nodes} epicenter={selected?shownEpicenter:null}/>{nodes.filter(n=>n.latitude!=null&&n.longitude!=null).map(n=><Marker key={n.module_id} position={[n.latitude,n.longitude]} icon={icon(nodeColor(n.status))} eventHandlers={{click:()=>setSelectedNode(n)}}><Popup><b>{n.name}</b><br/>ID: {n.module_id}<br/>Status: {n.status}<br/>Source: {n.source}</Popup></Marker>)}
+      <div className="map-card"><div className="map-toolbar"><div><strong>NODE NETWORK</strong><span>OpenStreetMap · Leaflet</span></div><button className="subtle-btn" onClick={refresh}>↻ Refresh</button></div><MapContainer center={center} zoom={11} scrollWheelZoom className="main-map"><TileLayer attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>' url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"/><FitBounds nodes={nodes} epicenter={selected?shownEpicenter:null} infrastructure={infrastructure} fitKey={selected || 'initial'}/>{nodes.filter(n=>n.latitude!=null&&n.longitude!=null).map(n=><Marker key={n.module_id} position={[n.latitude,n.longitude]} icon={icon(nodeColor(n.status))} eventHandlers={{click:()=>setSelectedNode(n)}}><Popup><b>{n.name}</b><br/>ID: {n.module_id}<br/>Status: {n.status}<br/>Source: {n.source}</Popup></Marker>)}
         {selected&&shownEpicenter&&<>{selectedAnalysis.affected_radius_km&&<Circle center={[shownEpicenter.latitude,shownEpicenter.longitude]} radius={selectedAnalysis.affected_radius_km*1000} pathOptions={{color:'#55b7d5',fillColor:'#55b7d5',fillOpacity:.10}}/>}<Circle center={[shownEpicenter.latitude,shownEpicenter.longitude]} radius={(shownEpicenter.uncertainty_km||10)*1000} pathOptions={{color:'#ef8d4b',fillColor:'#ef8d4b',fillOpacity:.12,dashArray:'7 7'}}/><Marker position={[shownEpicenter.latitude,shownEpicenter.longitude]} icon={L.divIcon({className:'epicenter-icon',html:'<span>✹</span>',iconSize:[30,30],iconAnchor:[15,15]})}><Popup>Estimated epicenter<br/>Uncertainty: ±{shownEpicenter.uncertainty_km||'—'} km</Popup></Marker></>}
-        {selected&&infrastructure.map((it,i)=><Marker key={it.osm_id||i} position={[it.latitude,it.longitude]} icon={infraIcon}><Popup><b>{it.name}</b><br/>{it.category}</Popup></Marker>)}
+        {selected&&infrastructure.map((it,i)=><Marker key={it.osm_id||i} position={[it.latitude,it.longitude]} icon={infraIcon(it.category)}><Popup><b>{it.name}</b><br/>{it.category}</Popup></Marker>)}
       </MapContainer><div className="map-footer"><span>● {nodes.length} nodes plotted</span><span>{selected?`Event selected · ${infrastructure.length} infrastructure points`:'Select an event to load its affected-region analysis'}</span></div></div>
       <div className="lower-grid"><section className="panel"><div className="panel-title"><div><div className="eyebrow">NETWORK</div><h2>Sensor nodes</h2></div><span className="count-pill">{nodes.length}</span></div><div className="node-list">{nodes.map(n=><div className="node-row" key={n.module_id}><span className={`node-status ${nodeColor(n.status)}`}/><div className="node-info"><b>{n.name}</b><small>ID {n.module_id} · {n.source}</small></div><span className={`state-label ${nodeColor(n.status)}`}>{n.status}</span></div>)}</div></section>
       <section className="panel"><div className="panel-title"><div><div className="eyebrow">RECENT ACTIVITY</div><h2>System log</h2></div><span className="count-pill">{logs.length}</span></div><div className="log-list">{logs.slice(0,7).map(l=><div className="log-row" key={l.id}><span className="log-mark"/><div><b>{l.event_type}</b><small>{l.description}</small></div><time>{fmt(l.created_at)}</time></div>)}</div></section></div>
     </section><aside className="side-column"><section className="panel events-panel"><div className="panel-title"><div><div className="eyebrow">DETECTION ARCHIVE</div><h2>Recent events</h2></div><span className="count-pill">{events.length}</span></div>{events.length===0?<div className="empty-state"><div className="empty-icon">⌁</div><b>No seismic events yet</b><p>Physical detections and simulator events will appear here.</p></div>:<div className="event-list">{events.map(e=><button key={e.id} className={`event-card ${selected===String(e.id)?'selected':''}`} onClick={()=>setSelected(String(e.id))}><div className="event-card-top"><span className="event-tag">{e.source==='simulated'?'SIMULATED':'HARDWARE'}</span><time>{fmt(e.detected_at)}</time></div><strong>{e.node_name||`Node ${e.module_id}`}</strong><div className="event-card-meta"><span>ID {e.node_event_id}</span><span>{e.received_samples||0} samples</span><span className={e.status==='complete'?'green-text':'red-text'}>{e.status}</span></div></button>)}</div>}</section>
       {selectedNode&&<section className="panel node-detail-panel"><div className="panel-title"><div><div className="eyebrow">SELECTED STATION</div><h2>{selectedNode.name}</h2></div><button className="text-btn" onClick={()=>setSelectedNode(null)}>Clear</button></div><div className="analysis-meta"><div><span>Module ID</span><b>{selectedNode.module_id}</b></div><div><span>Connection</span><b className={selectedNode.status==='online'?'green-text':selectedNode.status==='event'?'red-text':''}>{selectedNode.status}</b></div><div><span>Coordinates</span><b>{selectedNode.latitude==null?'Not set':`${Number(selectedNode.latitude).toFixed(5)}, ${Number(selectedNode.longitude).toFixed(5)}`}</b></div><div><span>Last heartbeat</span><b>{fmt(selectedNode.last_seen)}</b></div></div><div className="analysis-summary"><div><span>LIVE X</span><b>{selectedNode.last_reading?.x_g??'—'} <small>g</small></b></div><div><span>LIVE Y / Z</span><b>{selectedNode.last_reading?.y_g??'—'} / {selectedNode.last_reading?.z_g??'—'}</b></div></div></section>}
-      {selected&&<section className="panel analysis-panel"><div className="panel-title"><div><div className="eyebrow">SELECTED DETECTION</div><h2>Event analysis</h2></div><div className="panel-actions"><button className="text-btn" onClick={()=>setSelected(null)}>Clear</button>{token&&<button className="text-btn danger" onClick={deleteSelectedEvent}>Delete</button>}</div></div>{!detail?<p className="muted">Loading event…</p>:<><div className="analysis-summary"><div><span>VECTOR RMS</span><b>{selectedAnalysis.vector_rms_g??'—'} <small>g</small></b></div><div><span>PEAK VECTOR</span><b>{selectedAnalysis.peak_vector_g??'—'} <small>g</small></b></div></div><div className="analysis-meta"><div><span>Node</span><b>{detail.node_name} · {detail.module_id}</b></div><div><span>Samples received</span><b>{detail.received_samples}/{detail.expected_samples||'—'}</b></div><div><span>Capture status</span><b>{detail.status}</b></div><div><span>Location solution</span><b>{selectedAnalysis.location_quality||'Awaiting associated nodes'}</b></div></div><Waveform samples={detail.waveform||[]}/><div className="analysis-note">{selectedAnalysis.disclaimer||'Waveform metrics are preliminary. Validated P/S classification is not yet enabled.'}</div><div className="infra-title"><b>Potentially exposed infrastructure</b><span>{infraLoading?'Loading…':`${infrastructure.length} found`}</span></div><p className="hint">Shown only for the selected event. Proximity is not a damage assessment.</p>{infrastructure.slice(0,8).map((it,i)=><div className="infra-row" key={it.osm_id||i}><span>✚</span><div><b>{it.name}</b><small>{it.category}</small></div></div>)}</>}</section>}
+      {selected&&<section className="panel analysis-panel"><div className="panel-title"><div><div className="eyebrow">SELECTED DETECTION</div><h2>Event analysis</h2></div><div className="panel-actions"><button className="text-btn" onClick={()=>setSelected(null)}>Clear</button>{token&&<button className="text-btn danger" onClick={deleteSelectedEvent}>Delete</button>}</div></div>{!detail?<p className="muted">Loading event…</p>:<><div className="analysis-summary"><div><span>VECTOR RMS</span><b>{selectedAnalysis.vector_rms_g??'—'} <small>g</small></b></div><div><span>PEAK VECTOR</span><b>{selectedAnalysis.peak_vector_g??'—'} <small>g</small></b></div></div><div className="analysis-meta"><div><span>Node</span><b>{detail.node_name} · {detail.module_id}</b></div><div><span>Samples received</span><b>{detail.received_samples}/{detail.expected_samples||'—'}</b></div><div><span>Capture status</span><b>{detail.status}</b></div><div><span>Location solution</span><b>{selectedAnalysis.location_quality||'Awaiting associated nodes'}</b></div></div><Waveform samples={detail.waveform||[]}/><div className="analysis-note">{selectedAnalysis.disclaimer||'Waveform metrics are preliminary. Validated P/S classification is not yet enabled.'}</div><div className="infra-title"><b>Potentially exposed infrastructure</b><span>{infraLoading?'Loading…':`${infrastructure.length} found`}</span></div><p className="hint">Shown only for the selected event. Proximity is not a damage assessment.</p>{infraError&&<div className="analysis-note" style={{borderLeftColor:'#e59b36',marginTop:10}}><b>Infrastructure lookup unavailable</b><p>{infraError}</p><button className="text-btn" onClick={()=>{setInfraError('');setInfraLoading(true);fetch(`${API}/api/v1/events/${selected}/infrastructure`).then(async r=>{const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.detail||`Request failed (${r.status})`);setInfrastructure(d.infrastructure||[]);setInfraRadius(d.radius_km??null)}).catch(e=>setInfraError(e.message)).finally(()=>setInfraLoading(false))}}>Retry lookup</button></div>}
+          {infraLoading&&<p className="hint">Querying OpenStreetMap Overpass for nearby facilities…</p>}
+          {!infraLoading&&!infraError&&infrastructure.length===0&&<p className="hint">No mapped facilities were returned in this radius. This does not prove that no facilities exist; OpenStreetMap coverage may be incomplete.</p>}
+          {infrastructure.length>0&&<><div className="infra-title"><b>Facilities list</b><span>{infrastructure.length} total · {infraRadius??'—'} km radius</span></div>
+          <div className="infra-filter"><button className="text-btn" onClick={()=>setInfraCategory('all')}>All ({infrastructure.length})</button>{[...new Set(infrastructure.map(x=>x.category))].sort().map(category=><button className="text-btn" key={category} onClick={()=>setInfraCategory(category)}>{category.replaceAll('_',' ')} ({infrastructure.filter(x=>x.category===category).length})</button>)}</div>
+          {infrastructure.filter(it=>infraCategory==='all'||it.category===infraCategory).map((it,i)=><div className="infra-row" key={it.osm_id||i}><span>{({healthcare:'🏥',education:'🎓',emergency:'🚨',shelter:'🏠',power:'⚡',water_utility:'💧',telecom:'📡',bridge:'🌉',road:'🛣️',rail:'🚉',airport:'✈️'})[it.category]||'📍'}</span><div><b>{it.name||'Unnamed structure'}</b><small>{it.category?.replaceAll('_',' ')} · {Number(it.latitude).toFixed(5)}, {Number(it.longitude).toFixed(5)}</small><small><a href={`https://www.openstreetmap.org/${it.osm_id}`} target="_blank" rel="noreferrer">View on OpenStreetMap ↗</a></small></div></div>)}</>}
+          <p className="hint">Source: OpenStreetMap via Overpass API. Nearby facilities are potentially exposed, not confirmed damaged. OSM coverage and tagging may be incomplete.</p></>}</section>}
     </aside></main>}
     <footer className="footer"><span>SEISMOLINK · EDUCATIONAL SEISMIC MONITORING PLATFORM</span><span>Signal metrics are experimental; not an earthquake warning service.</span></footer>
     {adminOpen&&<AdminModal token={token} setToken={setToken} onClose={()=>setAdminOpen(false)} onRefresh={refresh}/>}

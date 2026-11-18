@@ -171,46 +171,199 @@ async def system_logs(limit: int = Query(100,ge=1,le=500)):
     return {'logs':[dict(r) for r in rows]}
 
 async def fetch_infrastructure(event: dict, radius_km: float | None):
-    analysis=json_value(event.get('analysis')) or {}
-    lat, lon = analysis.get('epicenter_latitude'), analysis.get('epicenter_longitude')
-    if lat is None or lon is None: raise HTTPException(409,'This event does not have an estimated epicenter yet.')
-    if radius_km is None: radius_km=analysis.get('affected_radius_km')
-    if radius_km is None: raise HTTPException(409,'No affected-region estimate is available for this event yet.')
-    radius = min(max(float(radius_km), 0.5), 50.0) * 1000
-    # Cached data is returned for this event region when available; Overpass is queried only on selection.
+    # Fetch mapped critical facilities around an estimated epicenter.
+    analysis = json_value(event.get('analysis')) or {}
+    lat = analysis.get('epicenter_latitude')
+    lon = analysis.get('epicenter_longitude')
+    if lat is None or lon is None:
+        return []
+
+    # A default proximity-search radius keeps the map useful when no
+    # scientifically estimated impact radius is available. It is NOT
+    # presented as an earthquake damage/impact radius.
+    if radius_km is None:
+        radius_km = analysis.get('affected_radius_km')
+    if radius_km is None:
+        radius_km = float(os.getenv('INFRASTRUCTURE_DEFAULT_RADIUS_KM', '5'))
+
+    radius_km = min(max(float(radius_km), 0.5), 50.0)
+    radius_m = int(radius_km * 1000)
+    lat, lon = float(lat), float(lon)
+
     async with db.acquire() as conn:
-        cached = await conn.fetch('''SELECT * FROM infrastructure_cache WHERE
-          abs(latitude-$1)<=$2/111000 AND abs(longitude-$3)<=$2/(111000*greatest(cos(radians($1)),0.2))
-          AND fetched_at > NOW() - INTERVAL '30 days' ''',lat, radius, lon)
-    if cached: return [{**dict(r), 'tags':json_value(r['tags'])} for r in cached]
-    query = f'''[out:json][timeout:25];(node(around:{int(radius)},{lat},{lon})[amenity~"hospital|clinic|school|university|police|fire_station|shelter"];way(around:{int(radius)},{lat},{lon})[amenity~"hospital|clinic|school|university|police|fire_station|shelter"];node(around:{int(radius)},{lat},{lon})[bridge];way(around:{int(radius)},{lat},{lon})[bridge];way(around:{int(radius)},{lat},{lon})[highway~"primary|secondary|trunk"];);out center tags;'''
-    try:
-        async with httpx.AsyncClient(timeout=35,headers={'User-Agent':'SeismoLink-Educational/1.0'}) as client:
-            response = await client.post('https://overpass-api.de/api/interpreter',data={'data':query})
-            response.raise_for_status(); elements = response.json().get('elements',[])
-    except Exception as e:
-        raise HTTPException(502,f'OpenStreetMap Overpass query failed: {e}')
-    items=[]
+        cached = await conn.fetch('''
+          SELECT * FROM infrastructure_cache
+          WHERE abs(latitude-$1)<=$2/111000.0
+          AND abs(longitude-$3)<=$2/(111000.0*greatest(cos(radians($1)),0.2))
+          AND fetched_at > NOW() - INTERVAL '7 days'
+        ''', lat, radius_m, lon)
+
+    import math
+    def within_radius(item_lat, item_lon):
+        lat1, lat2 = math.radians(lat), math.radians(float(item_lat))
+        dlat = lat2 - lat1
+        dlon = math.radians(float(item_lon) - lon)
+        a = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
+        return 6371.0 * 2 * math.asin(math.sqrt(min(1.0, a))) <= radius_km
+
+    if cached:
+        return [{**dict(row), 'tags': json_value(row['tags'])}
+                for row in cached if within_radius(row['latitude'], row['longitude'])]
+
+    query = f'''[out:json][timeout:40];
+    (
+      nwr(around:{radius_m},{lat},{lon})[amenity~"^(hospital|clinic|doctors|dentist|school|college|university|kindergarten|police|fire_station|shelter|ambulance_station)$"];
+      nwr(around:{radius_m},{lat},{lon})[emergency~"^(ambulance_station|fire_station|disaster_response|shelter)$"];
+      nwr(around:{radius_m},{lat},{lon})[healthcare];
+      nwr(around:{radius_m},{lat},{lon})[power~"^(plant|substation|generator)$"];
+      nwr(around:{radius_m},{lat},{lon})[man_made~"^(water_works|wastewater_plant|water_tower)$"];
+      nwr(around:{radius_m},{lat},{lon})[telecom~"^(exchange|data_centre)$"];
+      nwr(around:{radius_m},{lat},{lon})[tower~"^(communication|communication.*)$"];
+      way(around:{radius_m},{lat},{lon})[bridge];
+      way(around:{radius_m},{lat},{lon})[highway~"^(motorway|trunk|primary|secondary)$"];
+      nwr(around:{radius_m},{lat},{lon})[railway~"^(station|halt)$"];
+      nwr(around:{radius_m},{lat},{lon})[aeroway~"^(aerodrome|terminal)$"];
+    );
+    out center tags;'''
+
+    elements = None
+    last_error = None
+    for endpoint in (
+        'https://overpass-api.de/api/interpreter',
+        'https://overpass.kumi.systems/api/interpreter',
+        'https://overpass.private.coffee/api/interpreter',
+    ):
+        try:
+            async with httpx.AsyncClient(timeout=50, headers={
+                'User-Agent': 'SeismoLink-Educational/1.0 (critical infrastructure map)'
+            }) as client:
+                response = await client.post(endpoint, data={'data': query})
+                response.raise_for_status()
+                elements = response.json().get('elements', [])
+                break
+        except Exception as exc:
+            last_error = exc
+
+    if elements is None:
+        raise HTTPException(502, f'OpenStreetMap Overpass lookup failed on the available servers: {last_error}')
+
+    items = []
     for el in elements:
-        tags=el.get('tags',{}); center=el.get('center',el)
-        if 'lat' not in center or 'lon' not in center: continue
-        amenity=tags.get('amenity') or ('bridge' if 'bridge' in tags else 'road' if 'highway' in tags else 'infrastructure')
-        category = 'hospital' if amenity in ('hospital','clinic') else 'education' if amenity in ('school','university') else 'emergency' if amenity in ('police','fire_station') else 'bridge' if amenity=='bridge' else 'road' if amenity=='road' else 'shelter'
-        items.append({'osm_id':f"{el.get('type','node')}/{el['id']}",'name':tags.get('name') or f'Unnamed {category}','category':category,'amenity_type':amenity,'latitude':center['lat'],'longitude':center['lon'],'tags':tags})
+        tags = el.get('tags') or {}
+        center = el.get('center', el)
+        if center.get('lat') is None or center.get('lon') is None:
+            continue
+        amenity = tags.get('amenity')
+        emergency = tags.get('emergency')
+        power = tags.get('power')
+        man_made = tags.get('man_made')
+        telecom = tags.get('telecom') or tags.get('tower')
+        highway = tags.get('highway')
+        railway = tags.get('railway')
+        aeroway = tags.get('aeroway')
+        healthcare = tags.get('healthcare')
+
+        if amenity in ('hospital', 'clinic', 'doctors', 'dentist') or healthcare:
+            category = 'healthcare'
+        elif amenity in ('school', 'college', 'university', 'kindergarten'):
+            category = 'education'
+        elif amenity in ('police', 'fire_station', 'ambulance_station') or emergency in ('ambulance_station', 'fire_station', 'disaster_response'):
+            category = 'emergency'
+        elif amenity == 'shelter' or emergency == 'shelter':
+            category = 'shelter'
+        elif power:
+            category = 'power'
+        elif man_made:
+            category = 'water_utility'
+        elif telecom:
+            category = 'telecom'
+        elif 'bridge' in tags:
+            category = 'bridge'
+        elif highway:
+            category = 'road'
+        elif railway:
+            category = 'rail'
+        elif aeroway:
+            category = 'airport'
+        else:
+            category = 'infrastructure'
+
+        osm_type = el.get('type', 'node')
+        items.append({
+            'osm_id': f"{osm_type}/{el['id']}",
+            'name': tags.get('name') or f"Unnamed {category.replace('_', ' ')}",
+            'category': category,
+            'amenity_type': amenity or emergency or power or man_made or telecom or healthcare or railway or aeroway or ('bridge' if 'bridge' in tags else highway) or 'infrastructure',
+            'latitude': float(center['lat']),
+            'longitude': float(center['lon']),
+            'tags': tags,
+        })
+
     if items:
         async with db.acquire() as conn:
-            for it in items:
-                await conn.execute('''INSERT INTO infrastructure_cache(osm_id,name,category,amenity_type,latitude,longitude,tags)
-                VALUES($1,$2,$3,$4,$5,$6,$7::jsonb) ON CONFLICT(osm_id) DO UPDATE SET name=EXCLUDED.name,category=EXCLUDED.category,latitude=EXCLUDED.latitude,longitude=EXCLUDED.longitude,tags=EXCLUDED.tags,fetched_at=NOW()''',it['osm_id'],it['name'],it['category'],it['amenity_type'],it['latitude'],it['longitude'],json.dumps(it['tags']))
+            for item in items:
+                await conn.execute('''
+                    INSERT INTO infrastructure_cache(osm_id,name,category,amenity_type,latitude,longitude,tags)
+                    VALUES($1,$2,$3,$4,$5,$6,$7::jsonb)
+                    ON CONFLICT(osm_id) DO UPDATE SET name=EXCLUDED.name,category=EXCLUDED.category,
+                    amenity_type=EXCLUDED.amenity_type,latitude=EXCLUDED.latitude,longitude=EXCLUDED.longitude,
+                    tags=EXCLUDED.tags,fetched_at=NOW()
+                ''', item['osm_id'], item['name'], item['category'], item['amenity_type'],
+                     item['latitude'], item['longitude'], json.dumps(item['tags']))
     return items
 
+
 @api.get('/api/v1/events/{event_id}/infrastructure')
-async def event_infrastructure(event_id: str, radius_km: float | None = Query(None,gt=0,le=50)):
-    async with db.acquire() as conn: row=await conn.fetchrow('SELECT * FROM seismic_events WHERE id=$1::uuid',event_id)
-    if not row: raise HTTPException(404,'Event not found')
-    event=dict(row); items=await fetch_infrastructure(event,radius_km)
-    # The proximity result is descriptive, not a damage or shaking-intensity prediction.
-    return {'event_id':event_id,'radius_km':radius_km or (json_value(event.get('analysis')) or {}).get('affected_radius_km'),'infrastructure':items,'interpretation':'Potentially exposed infrastructure within the selected analysis radius; not a damage assessment.'}
+async def event_infrastructure(event_id: str, radius_km: float | None = Query(None, gt=0, le=50)):
+    async with db.acquire() as conn:
+        row = await conn.fetchrow('SELECT * FROM seismic_events WHERE id=$1::uuid', event_id)
+    if not row:
+        raise HTTPException(404, 'Event not found')
+
+    event = dict(row)
+    analysis = json_value(event.get('analysis')) or {}
+    lat = analysis.get('epicenter_latitude')
+    lon = analysis.get('epicenter_longitude')
+
+    # Missing location is a valid pending state, not an HTTP conflict.
+    if lat is None or lon is None:
+        return {
+            'event_id': event_id,
+            'available': False,
+            'status': 'pending',
+            'reason': 'Epicenter estimation is pending. At least three associated stations with coordinates and arrival-time information are needed for a preliminary 2D estimate.',
+            'epicenter': None,
+            'radius_km': None,
+            'radius_source': None,
+            'infrastructure_count': 0,
+            'infrastructure': [],
+            'interpretation': 'Infrastructure lookup is unavailable until an epicenter has been estimated; no location is being guessed.',
+        }
+
+    estimated_radius = analysis.get('affected_radius_km')
+    if radius_km is not None:
+        search_radius = radius_km
+        radius_source = 'user_selected'
+    elif estimated_radius is not None:
+        search_radius = float(estimated_radius)
+        radius_source = 'analysis_estimate'
+    else:
+        search_radius = float(os.getenv('INFRASTRUCTURE_DEFAULT_RADIUS_KM', '5'))
+        radius_source = 'default_search_radius'
+
+    search_radius = min(max(float(search_radius), 0.5), 50.0)
+    items = await fetch_infrastructure(event, search_radius)
+    return {
+        'event_id': event_id,
+        'available': True,
+        'status': 'ready',
+        'epicenter': {'latitude': float(lat), 'longitude': float(lon)},
+        'radius_km': search_radius,
+        'radius_source': radius_source,
+        'infrastructure_count': len(items),
+        'infrastructure': items,
+        'interpretation': 'Mapped infrastructure within the selected proximity-search radius. Proximity does not establish damage or shaking intensity.',
+    }
 
 async def broadcast_nodes():
     async with db.acquire() as conn: rows=await conn.fetch('SELECT module_id,name,latitude,longitude,location_description,source,status,last_seen,last_reading,firmware FROM nodes ORDER BY module_id')
@@ -409,40 +562,156 @@ async def event_end(sid,data):
         await sio.emit('event_completed',{'event_id':event_uuid,'module_id':module_id,'analysis':analysis,'received_samples':len(samples)})
         await broadcast_nodes()
         await log_event('Seismic Event',f'Node {module_id} completed event {node_event_id}; samples={len(samples)}/{expected}')
-        if state.get('group_id'): await estimate_group(state['group_id'])
+        await associate_simultaneous_events(event_uuid, state.get('group_id'))
         print(f'[socketio] event_end module={module_id} event={node_event_id} persisted={len(samples)}/{expected} path={path}',flush=True)
         return {'ok':True,'event_id':event_uuid,'received_samples':len(samples),'expected_samples':expected,'missing_samples':missing,'status':'complete'}
 
+async def associate_simultaneous_events(event_id: str, existing_group_id: str | None = None):
+    # Associate completed detections from different nodes in a short time window.
+    # Explicit simulator scenario/event group IDs are preserved. Otherwise,
+    # detections within the configured window are grouped across all node sources.
+    window_seconds = max(1.0, float(os.getenv('EVENT_ASSOCIATION_WINDOW_SECONDS', '10')))
+    async with db.acquire() as conn:
+        current = await conn.fetchrow(
+            'SELECT id,module_id,group_id,detected_at FROM seismic_events WHERE id=$1::uuid',
+            event_id
+        )
+        if not current:
+            return
+        group_id = existing_group_id or current['group_id']
+
+        rows = await conn.fetch('''
+            SELECT DISTINCT ON (e.module_id)
+                   e.id,e.module_id,e.group_id,e.detected_at
+            FROM seismic_events e
+            WHERE e.status='complete'
+              AND e.module_id <> $3
+              AND (
+                  e.detected_at BETWEEN
+                      $1::timestamptz - ($2::text || ' seconds')::interval
+                      AND $1::timestamptz + ($2::text || ' seconds')::interval
+                  OR ($4::text IS NOT NULL AND e.group_id=$4)
+              )
+            ORDER BY e.module_id,
+                     abs(extract(epoch FROM (e.detected_at - $1::timestamptz)))
+        ''', current['detected_at'], str(window_seconds), current['module_id'], group_id)
+
+        # Include the current event; require detections from at least three
+        # distinct stations before attempting a 2D epicenter estimate.
+        candidates = [current, *rows]
+        distinct_modules = {int(r['module_id']) for r in candidates}
+        if len(distinct_modules) < 3:
+            if group_id:
+                await estimate_group(str(group_id))
+            return
+
+        group_id = str(group_id or uuid.uuid4())
+        event_ids = [str(r['id']) for r in candidates]
+        await conn.execute(
+            'UPDATE seismic_events SET group_id=$2 WHERE id=ANY($1::uuid[])',
+            event_ids, group_id
+        )
+
+    await estimate_group(group_id)
+
+
 async def estimate_group(group_id: str):
     async with db.acquire() as conn:
-        rows=await conn.fetch('''SELECT e.id,e.module_id,e.analysis,n.latitude,n.longitude,n.name FROM seismic_events e JOIN nodes n USING(module_id)
-        WHERE e.group_id=$1 AND e.status='complete' AND n.latitude IS NOT NULL AND n.longitude IS NOT NULL''',group_id)
-    if len(rows)<2: return
-    # Demonstration-grade estimate: P-arrival travel-time grid search with fixed nominal P velocity.
-    # For real operation, replace with calibrated local velocity model and validated arrival picks.
-    stations=[dict(r) for r in rows]
-    p_times=[(json_value(s['analysis']) or {}).get('p_arrival_unix_ms') for s in stations]
-    if any(t is None for t in p_times): return
+        rows = await conn.fetch('''
+            SELECT e.id,e.module_id,e.detected_at,e.analysis,n.latitude,n.longitude,n.name
+            FROM seismic_events e JOIN nodes n USING(module_id)
+            WHERE e.group_id=$1 AND e.status='complete'
+              AND n.latitude IS NOT NULL AND n.longitude IS NOT NULL
+            ORDER BY e.detected_at
+        ''', group_id)
+
+    # Three distinct, non-collinear stations are the minimum for this
+    # preliminary 2D grid-search implementation.
+    stations = [dict(r) for r in rows]
+    if len({int(s['module_id']) for s in stations}) < 3:
+        return
+
     import math
-    lat0=sum(s['latitude'] for s in stations)/len(stations); lon0=sum(s['longitude'] for s in stations)/len(stations)
-    km_lat=111.32; km_lon=111.32*max(math.cos(math.radians(lat0)),0.2)
-    xs=[(s['longitude']-lon0)*km_lon for s in stations]; ys=[(s['latitude']-lat0)*km_lat for s in stations]
-    t0=min(p_times); best=None
-    for gx in range(-50,51,2):
-        for gy in range(-50,51,2):
-            distances=[math.hypot(gx-x,gy-y) for x,y in zip(xs,ys)]
-            # Fit origin time as mean residual after nominal P-wave velocity 6 km/s.
-            residuals=[(t-t0)/1000-d/6 for t,d in zip(p_times,distances)]
-            mean=sum(residuals)/len(residuals)
-            error=sum((r-mean)**2 for r in residuals)/len(residuals)
-            if best is None or error<best[0]: best=(error,gx,gy)
-    _,gx,gy=best; epic_lat=lat0+gy/km_lat; epic_lon=lon0+gx/km_lon
-    uncertainty=max(2.0, math.sqrt(best[0])*6 + (20 if len(stations)<3 else 5))
-    ids=[str(s['id']) for s in stations]
+    lat0 = sum(float(s['latitude']) for s in stations) / len(stations)
+    lon0 = sum(float(s['longitude']) for s in stations) / len(stations)
+    km_lat = 111.32
+    km_lon = 111.32 * max(math.cos(math.radians(lat0)), 0.2)
+    xs = [(float(s['longitude']) - lon0) * km_lon for s in stations]
+    ys = [(float(s['latitude']) - lat0) * km_lat for s in stations]
+
+    # Prefer actual P picks. If unavailable, use detection timestamps as
+    # explicitly-labelled trigger-time proxies (lower confidence).
+    p_times = []
+    time_sources = []
+    for station in stations:
+        analysis = json_value(station.get('analysis')) or {}
+        p_time = analysis.get('p_arrival_unix_ms')
+        if p_time is not None:
+            p_times.append(float(p_time))
+            time_sources.append('p_arrival_pick')
+        else:
+            detected = station.get('detected_at')
+            if detected is None:
+                return
+            p_times.append(detected.timestamp() * 1000.0)
+            time_sources.append('detection_timestamp_proxy')
+
+    # Reject degenerate station geometry (all stations almost on one line).
+    area2 = 0.0
+    for i in range(1, len(xs) - 1):
+        area2 = max(area2, abs((xs[i] - xs[0]) * (ys[i + 1] - ys[0]) - (xs[i + 1] - xs[0]) * (ys[i] - ys[0])))
+    if area2 < 0.5:
+        return
+
+    t0 = min(p_times)
+    best = None
+    for gx in range(-50, 51, 1):
+        for gy in range(-50, 51, 1):
+            distances = [math.hypot(gx - x, gy - y) for x, y in zip(xs, ys)]
+            residuals = [(t - t0) / 1000.0 - d / 6.0 for t, d in zip(p_times, distances)]
+            origin_offset = sum(residuals) / len(residuals)
+            error = sum((r - origin_offset) ** 2 for r in residuals) / len(residuals)
+            if best is None or error < best[0]:
+                best = (error, gx, gy, origin_offset)
+
+    if best is None:
+        return
+
+    error, gx, gy, origin_offset = best
+    epic_lat = lat0 + gy / km_lat
+    epic_lon = lon0 + gx / km_lon
+    uncertainty = max(2.0, math.sqrt(error) * 6.0 + (15.0 if 'detection_timestamp_proxy' in time_sources else 3.0))
+    quality = 'low_confidence_trigger_time_proxy' if 'detection_timestamp_proxy' in time_sources else ('preliminary' if len(stations) < 4 else 'demo_estimate')
+    ids = [str(s['id']) for s in stations]
+    metadata = {
+        'epicenter_latitude': epic_lat,
+        'epicenter_longitude': epic_lon,
+        'uncertainty_km': round(uncertainty, 1),
+        'participating_nodes': len(stations),
+        'participating_module_ids': sorted({int(s['module_id']) for s in stations}),
+        'location_quality': quality,
+        'arrival_time_source': 'mixed' if len(set(time_sources)) > 1 else time_sources[0],
+        'location_method': 'nominal_6km_s_grid_search',
+        'location_disclaimer': 'Preliminary educational estimate; trigger timestamps are not validated P-wave picks and this is not a calibrated earthquake location.'
+    }
+
     async with db.acquire() as conn:
         for eid in ids:
-            await conn.execute("UPDATE seismic_events SET analysis=analysis || $2::jsonb WHERE id=$1::uuid",eid,json.dumps({'epicenter_latitude':epic_lat,'epicenter_longitude':epic_lon,'uncertainty_km':round(uncertainty,1),'participating_nodes':len(stations),'location_quality':'preliminary' if len(stations)<3 else 'demo_estimate'}))
-    await sio.emit('epicenter_updated',{'group_id':group_id,'latitude':epic_lat,'longitude':epic_lon,'uncertainty_km':round(uncertainty,1),'participating_nodes':len(stations),'quality':'preliminary' if len(stations)<3 else 'demo_estimate','event_ids':ids})
+            await conn.execute(
+                'UPDATE seismic_events SET analysis=analysis || $2::jsonb WHERE id=$1::uuid',
+                eid, json.dumps(metadata)
+            )
+
+    await sio.emit('epicenter_updated', {
+        'group_id': group_id,
+        'latitude': epic_lat,
+        'longitude': epic_lon,
+        'uncertainty_km': round(uncertainty, 1),
+        'participating_nodes': len(stations),
+        'module_ids': metadata['participating_module_ids'],
+        'quality': quality,
+        'event_ids': ids
+    })
 
 async def offline_monitor():
     while True:

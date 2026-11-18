@@ -1,0 +1,18 @@
+MAP AUTO-ZOOM FIX
+
+Updated:
+- frontend/src/pages/ImpactMap.jsx
+- frontend/src/App.jsx
+
+Cause:
+- ImpactMap's MapController called flyTo whenever the selected event object changed.
+  Polling recreated that object and reset the user's zoom.
+- App.jsx's FitBounds called fitBounds whenever live node/event/infrastructure arrays
+  changed. Live refreshes therefore repeatedly overrode manual zoom and pan.
+
+Fix:
+- ImpactMap now moves the map only when the selected event ID or its coordinates change.
+- The overview map now fits bounds only on initial available coordinates and when the
+  selected event ID changes, not on every live data refresh.
+
+No backend changes are required for this map zoom fix.

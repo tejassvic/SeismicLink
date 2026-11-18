@@ -1,12 +1,11 @@
-import React, { useState, useEffect, useCallback } from 'react'
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { API_BASE_URL } from '../config'
 import { MapContainer, TileLayer, Marker, Popup, Circle, useMap } from 'react-leaflet'
 import 'leaflet/dist/leaflet.css'
 import MarkerClusterGroup from 'react-leaflet-cluster'
-
-// Fix for default markers
 import L from 'leaflet'
+
 delete L.Icon.Default.prototype._getIconUrl
 L.Icon.Default.mergeOptions({
   iconRetinaUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.7.1/images/marker-icon-2x.png',
@@ -15,519 +14,265 @@ L.Icon.Default.mergeOptions({
 })
 
 const INFRA_ICONS = {
-  hospital: '🏥',
-  school: '🎓',
-  fire_station: '🔥',
-  police: '👮',
-  airport: '✈️',
-  bus_station: '🚌',
-  power_station: '⚡',
-  shelter: '🏠',
-  clinic: '💊',
-  university: '🎓',
-  default: '📍',
+  hospital: '🏥', clinic: '💊', school: '🏫', university: '🎓',
+  police: '👮', fire_station: '🚒', shelter: '🏠', bridge: '🌉',
+  road: '🛣️', default: '📍',
+}
+const CATEGORY_LABELS = {
+  hospital: 'Hospital', clinic: 'Clinic', education: 'Education',
+  emergency: 'Emergency services', shelter: 'Shelter',
+  bridge: 'Bridge', road: 'Major road', infrastructure: 'Infrastructure',
+}
+const CATEGORY_COLORS = {
+  hospital: '#dc2626', clinic: '#dc2626', education: '#2563eb',
+  emergency: '#ea580c', shelter: '#16a34a', bridge: '#7c3aed',
+  road: '#64748b', infrastructure: '#64748b',
 }
 
-function getInfrastructureIcon(urgency, category) {
-  const color = urgency === 'High' ? '#ef4444' :
-    urgency === 'Medium' ? '#f59e0b' :
-    urgency === 'Low' ? '#10b981' : '#6b7280'
-  const size = urgency === 'High' ? 16 : urgency === 'Medium' ? 12 : 10
-
+function getInfrastructureIcon(infra) {
+  const color = CATEGORY_COLORS[infra.category] || '#64748b'
   return L.divIcon({
     className: 'custom-div-icon',
-    html: `<div style="
-      background: ${color};
-      width: ${size}px;
-      height: ${size}px;
-      border-radius: 50%;
-      border: 2px solid white;
-      box-shadow: 0 0 8px ${color}66, 0 2px 6px rgba(0,0,0,0.2);
-      transition: all 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
-    "></div>`,
+    html: `<div style="width:24px;height:24px;border-radius:50%;background:${color};border:2px solid white;box-shadow:0 1px 7px #0006;display:flex;align-items:center;justify-content:center;font-size:13px">${INFRA_ICONS[infra.amenity_type] || INFRA_ICONS.default}</div>`,
+    iconSize: [24, 24],
+    iconAnchor: [12, 12],
+  })
+}
+
+function getEventIcon(selected = false) {
+  const size = selected ? 32 : 25
+  return L.divIcon({
+    className: 'custom-div-icon',
+    html: `<div style="width:${size}px;height:${size}px;background:#dc2626;border:3px solid white;border-radius:50%;box-shadow:0 0 12px #ef444499;display:flex;align-items:center;justify-content:center;color:white;font-weight:800">E</div>`,
     iconSize: [size, size],
     iconAnchor: [size / 2, size / 2],
   })
 }
 
-function getEventIcon(isSelected = false) {
-  return L.divIcon({
-    className: 'custom-div-icon',
-    html: `<div style="
-      width: ${isSelected ? 32 : 24}px;
-      height: ${isSelected ? 32 : 24}px;
-      background: linear-gradient(135deg, #ef4444, #dc2626);
-      border-radius: 50% 50% 50% 0;
-      transform: rotate(-45deg);
-      border: 3px solid white;
-      box-shadow: 0 0 ${isSelected ? 20 : 8}px rgba(239,68,68,0.5);
-      transition: all 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
-      animation: ${isSelected ? 'pulse-glow 1.5s ease-in-out infinite' : 'none'};
-    ">
-      <div style="
-        position: absolute;
-        top: 5px;
-        left: 5px;
-        width: 8px;
-        height: 8px;
-        border-radius: 50%;
-        background: white;
-      "></div>
-    </div>`,
-    iconSize: isSelected ? [32, 32] : [24, 24],
-    iconAnchor: isSelected ? [16, 32] : [12, 24],
-  })
-}
-
-// Map controller for centering
-function MapController({ selectedEvent, flyTo }) {
+function MapController({ event }) {
   const map = useMap()
+  const lastTargetRef = useRef(null)
+
   useEffect(() => {
-    if (selectedEvent && flyTo) {
-      map.flyTo([selectedEvent.latitude, selectedEvent.longitude], 12, {
-        duration: 1.2,
-        easeLinearity: 0.25
-      })
-    }
-  }, [selectedEvent, map, flyTo])
+    if (event?.mapLatitude == null || event?.mapLongitude == null) return
+
+    // Only move the map when the selected event actually changes.
+    // Event objects are refreshed/recreated during polling; depending on the
+    // whole object here would repeatedly reset the user's manual zoom.
+    const targetKey = `${event.event_id}:${event.mapLatitude}:${event.mapLongitude}`
+    if (lastTargetRef.current === targetKey) return
+
+    lastTargetRef.current = targetKey
+    map.flyTo([Number(event.mapLatitude), Number(event.mapLongitude)], 11, {
+      duration: 0.8,
+      animate: true,
+    })
+  }, [event?.event_id, event?.mapLatitude, event?.mapLongitude, map])
+
   return null
 }
 
-// Event selector panel item
-function EventSelectorItem({ event, isSelected, onClick, isFrequent }) {
-  const magColor = event.magnitude >= 7 ? 'from-red-500 to-red-700' :
-    event.magnitude >= 5 ? 'from-orange-400 to-orange-600' :
-    event.magnitude >= 3 ? 'from-amber-400 to-amber-600' : 'from-blue-400 to-blue-600'
-
-  return (
-    <button
-      onClick={onClick}
-      className={`w-full text-left p-3 rounded-xl transition-all duration-300 ${
-        isSelected
-          ? 'bg-blue-50 border-2 border-blue-500 shadow-md scale-[1.02]'
-          : 'hover:bg-gray-50 border-2 border-transparent hover:border-gray-200'
-      } ${isFrequent ? 'ring-2 ring-amber-300' : ''}`}
-    >
-      <div className="flex items-center gap-3">
-        <div className={`w-10 h-10 rounded-lg bg-gradient-to-br ${magColor} flex items-center justify-center text-white font-bold text-sm shadow-sm shrink-0`}>
-          {event.magnitude}
-        </div>
-        <div className="min-w-0 flex-1">
-          <p className="text-sm font-semibold truncate" style={{ color: 'var(--text-color)' }}>
-            {event.event_name}
-          </p>
-          <p className="text-xs opacity-60" style={{ color: 'var(--text-color)' }}>
-            {event.depth_km}km depth · {event.critical_infrastructure?.length || 0} structures
-          </p>
-        </div>
-        {isSelected && <span className="text-blue-500 text-lg">✓</span>}
-      </div>
-    </button>
-  )
+function getEventCoordinates(event) {
+  const analysis = event.analysis || {}
+  const latitude = analysis.epicenter_latitude ?? event.node_latitude
+  const longitude = analysis.epicenter_longitude ?? event.node_longitude
+  return { latitude, longitude }
 }
 
-// Enhanced popup content
-function EnhancedPopup({ event, darkMode = false }) {
-  const formatDate = (d) => {
-    try {
-      return new Date(d).toLocaleDateString('en-US', {
-        year: 'numeric', month: 'short', day: 'numeric',
-        hour: '2-digit', minute: '2-digit'
-      })
-    } catch { return d }
-  }
-
-  const titleColor = darkMode ? '#f1f5f9' : '#111827'
-  const mutedColor = darkMode ? '#94a3b8' : '#6b7280'
-  const borderColor = darkMode ? '#334155' : '#f3f4f6'
-  const valueColor = darkMode ? '#f1f5f9' : '#111827'
-
-  return (
-    <div className="min-w-[260px] p-1">
-      <div className="flex items-center gap-3 mb-3">
-        <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-red-500 to-orange-600 flex items-center justify-center text-white font-bold text-lg shadow-sm">
-          {event.magnitude}
-        </div>
-        <div>
-          <h3 className="font-bold text-base" style={{ color: titleColor }}>{event.event_name}</h3>
-          <p className="text-xs" style={{ color: mutedColor }}>{event.event_type}</p>
-        </div>
-      </div>
-      <div className="space-y-1.5 text-sm">
-        <div className="flex justify-between py-1" style={{ borderBottom: `1px solid ${borderColor}` }}>
-          <span style={{ color: mutedColor }}>Magnitude</span>
-          <span className="font-semibold" style={{ color: valueColor }}>{event.magnitude}</span>
-        </div>
-        <div className="flex justify-between py-1" style={{ borderBottom: `1px solid ${borderColor}` }}>
-          <span style={{ color: mutedColor }}>Depth</span>
-          <span className="font-semibold" style={{ color: valueColor }}>{event.depth_km} km</span>
-        </div>
-        <div className="flex justify-between py-1" style={{ borderBottom: `1px solid ${borderColor}` }}>
-          <span style={{ color: mutedColor }}>Location</span>
-          <span className="font-semibold" style={{ color: valueColor }}>{event.latitude?.toFixed(3)}, {event.longitude?.toFixed(3)}</span>
-        </div>
-        <div className="flex justify-between py-1">
-          <span style={{ color: mutedColor }}>Time</span>
-          <span className="font-semibold" style={{ color: valueColor }}>{formatDate(event.origin_time)}</span>
-        </div>
-      </div>
-    </div>
-  )
+function formatDate(value) {
+  if (!value) return 'Unknown time'
+  const date = new Date(value)
+  return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString()
 }
 
 function ImpactMap({ darkMode = false }) {
   const { eventId } = useParams()
   const navigate = useNavigate()
-  const [earthquakeEvents, setEarthquakeEvents] = useState([])
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState(null)
+  const [events, setEvents] = useState([])
   const [selectedEvent, setSelectedEvent] = useState(null)
-  const [flyTo, setFlyTo] = useState(false)
+  const [infrastructure, setInfrastructure] = useState([])
+  const [loadingEvents, setLoadingEvents] = useState(true)
+  const [loadingInfrastructure, setLoadingInfrastructure] = useState(false)
+  const [eventsError, setEventsError] = useState('')
+  const [infrastructureError, setInfrastructureError] = useState('')
+  const [radiusKm, setRadiusKm] = useState('')
+  const [categoryFilter, setCategoryFilter] = useState('all')
   const [sidebarOpen, setSidebarOpen] = useState(true)
-  const [filterUrgency, setFilterUrgency] = useState('all')
-  const [showHeatmap, setShowHeatmap] = useState(false)
 
-  // Track usage for frequent event selection
-  const [frequentEvents] = useState(() => {
+  const loadEvents = useCallback(async () => {
+    setLoadingEvents(true)
+    setEventsError('')
     try {
-      const saved = localStorage.getItem('seismo_frequent_events')
-      return saved ? new Set(JSON.parse(saved)) : new Set()
-    } catch { return new Set() }
-  })
-
-  useEffect(() => {
-    const fetchEvents = async () => {
-      try {
-        const res = await fetch(`${API_BASE_URL}/api/v1/earthquake-events?page=1&page_size=50`)
-        if (!res.ok) {
-          setError('Failed to fetch earthquake data')
-          setLoading(false)
-          return
+      const response = await fetch(`${API_BASE_URL}/api/v1/events?limit=100`)
+      const payload = await response.json().catch(() => ({}))
+      if (!response.ok) throw new Error(payload.detail || `Could not load events (${response.status})`)
+      const mapped = (payload.events || []).map(event => {
+        const coords = getEventCoordinates(event)
+        return {
+          ...event,
+          event_id: event.id,
+          event_name: event.node_name ? `Event — ${event.node_name}` : `Seismic event ${String(event.id).slice(0, 8)}`,
+          magnitude: event.analysis?.magnitude_estimate ?? event.analysis?.magnitude ?? null,
+          mapLatitude: coords.latitude,
+          mapLongitude: coords.longitude,
         }
-        const data = await res.json()
-        setEarthquakeEvents(data.events || [])
-        
-        if (eventId) {
-          const event = data.events.find(e => e.event_id === eventId)
-          if (event) {
-            setSelectedEvent(event)
-            setFlyTo(true)
-          }
-        }
-        setLoading(false)
-      } catch {
-        setError('Network error: Unable to connect to the server')
-        setLoading(false)
-      }
+      }).filter(event => Number.isFinite(Number(event.mapLatitude)) && Number.isFinite(Number(event.mapLongitude)))
+      setEvents(mapped)
+      setSelectedEvent(current => {
+        const wantedId = eventId || current?.event_id
+        return mapped.find(item => item.event_id === wantedId) || mapped[0] || null
+      })
+    } catch (error) {
+      setEventsError(error.message || 'Network error while loading seismic events')
+    } finally {
+      setLoadingEvents(false)
     }
-    fetchEvents()
   }, [eventId])
 
-  const handleEventSelect = useCallback((event) => {
-    setSelectedEvent(event)
-    setFlyTo(true)
-    // Track frequent events
+  useEffect(() => { loadEvents() }, [loadEvents])
+
+  const loadInfrastructure = useCallback(async (event) => {
+    if (!event) {
+      setInfrastructure([])
+      setInfrastructureError('')
+      return
+    }
+    const analysis = event.analysis || {}
+    if (analysis.epicenter_latitude == null || analysis.epicenter_longitude == null) {
+      setInfrastructure([])
+      setInfrastructureError('An estimated epicenter is not available for this event yet. Infrastructure search needs an epicenter calculated from multiple station readings.')
+      return
+    }
+    // Affected radius is optional. When absent, the backend uses its
+    // configured proximity-search default (5 km), not an impact estimate.
+    const estimatedRadius = Number(analysis.affected_radius_km)
+    const radius = Number.isFinite(estimatedRadius) && estimatedRadius > 0 ? estimatedRadius : 5
+
+    setLoadingInfrastructure(true)
+    setInfrastructureError('')
+    setInfrastructure([])
+    setRadiusKm(radius)
     try {
-      const saved = localStorage.getItem('seismo_frequent_events')
-      const freq = saved ? new Set(JSON.parse(saved)) : new Set()
-      freq.add(event.event_id)
-      localStorage.setItem('seismo_frequent_events', JSON.stringify([...freq]))
-    } catch {}
+      const response = await fetch(`${API_BASE_URL}/api/v1/events/${encodeURIComponent(event.event_id)}/infrastructure?radius_km=${encodeURIComponent(Math.min(radius, 50))}`)
+      const payload = await response.json().catch(() => ({}))
+      if (!response.ok) throw new Error(payload.detail || `OpenStreetMap lookup failed (${response.status})`)
+      setInfrastructure(payload.infrastructure || [])
+      setRadiusKm(payload.radius_km ?? radius)
+      if (payload.status === 'pending') {
+        setInfrastructureError(payload.reason || 'Epicenter estimation is pending for this event.')
+      }
+    } catch (error) {
+      setInfrastructureError(`${error.message || 'Unable to retrieve infrastructure'}. The lookup uses the OpenStreetMap Overpass API; try again in a moment if the service is busy.`)
+    } finally {
+      setLoadingInfrastructure(false)
+    }
   }, [])
 
-  // Get max magnitude for stats
-  const maxMagnitude = earthquakeEvents.length > 0
-    ? Math.max(...earthquakeEvents.map(e => e.magnitude || 0))
-    : 0
-  const avgDepth = earthquakeEvents.length > 0
-    ? (earthquakeEvents.reduce((s, e) => s + (e.depth_km || 0), 0) / earthquakeEvents.length).toFixed(1)
-    : 0
+  useEffect(() => {
+    if (selectedEvent) {
+      loadInfrastructure(selectedEvent)
+      if (eventId !== selectedEvent.event_id) navigate(`/impact-map/${selectedEvent.event_id}`, { replace: true })
+    }
+  }, [selectedEvent, loadInfrastructure, eventId, navigate])
 
-  // Filter all infrastructure by urgency
-  const allInfrastructures = earthquakeEvents.flatMap(event =>
-    (event.critical_infrastructure || [])
-      .filter(infra => filterUrgency === 'all' || infra.urgency === filterUrgency)
-      .map((infra, idx) => ({ ...infra, event, key: `${event.event_id}-${infra.id || idx}` }))
-  ).filter(infra => typeof infra.latitude === 'number' && typeof infra.longitude === 'number')
-
-  if (loading) {
-    return (
-      <div className="flex items-center justify-center h-64">
-        <div className="text-center">
-          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600 mx-auto mb-4"></div>
-          <p className="text-lg" style={{ color: 'var(--text-color)' }}>Loading map data...</p>
-        </div>
-      </div>
-    )
+  const chooseEvent = (event) => {
+    setSelectedEvent(event)
+    setCategoryFilter('all')
   }
 
-  if (error) {
-    return (
-      <div className="flex items-center justify-center h-64">
-        <div className="text-center">
-          <div className="text-red-500 text-6xl mb-4">⚠️</div>
-          <h2 className="text-xl font-semibold mb-2" style={{ color: 'var(--text-color)' }}>Error Loading Data</h2>
-          <p className="mb-4" style={{ color: 'var(--text-color)' }}>{error}</p>
-          <button onClick={() => window.location.reload()} className="morphic-btn">
-            Try Again
-          </button>
-        </div>
-      </div>
-    )
+  const categories = useMemo(
+    () => [...new Set(infrastructure.map(item => item.category).filter(Boolean))].sort(),
+    [infrastructure]
+  )
+  const visibleInfrastructure = useMemo(
+    () => categoryFilter === 'all' ? infrastructure : infrastructure.filter(item => item.category === categoryFilter),
+    [infrastructure, categoryFilter]
+  )
+
+  if (loadingEvents) {
+    return <div className="flex items-center justify-center h-64"><div className="text-center"><div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600 mx-auto mb-4" /><p style={{ color: 'var(--text-color)' }}>Loading seismic events…</p></div></div>
   }
+
+  if (eventsError) {
+    return <div className="morphic-card p-6 text-center"><h2 className="text-xl font-semibold mb-2">Unable to load impact map</h2><p className="mb-4 text-red-500">{eventsError}</p><button className="morphic-btn px-4 py-2" onClick={loadEvents}>Try again</button></div>
+  }
+
+  const selectedAnalysis = selectedEvent?.analysis || {}
+  const affectedRadius = Number(radiusKm || selectedAnalysis.affected_radius_km || 0)
 
   return (
     <div className="h-full flex flex-col gap-4">
-      {/* Header */}
-      <div className="flex items-center justify-between animate-fade-in-up">
+      <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <h1 className="text-3xl font-bold adaptive-title" style={{ color: 'var(--text-color)' }}>🗺️ Impact Map</h1>
-          <p className="mt-1 opacity-70 adaptive-text" style={{ color: 'var(--text-color)' }}>
-            Visualize seismic events and critical infrastructure
-          </p>
+          <p className="mt-1 opacity-70 adaptive-text" style={{ color: 'var(--text-color)' }}>OpenStreetMap critical infrastructure near the selected seismic event</p>
         </div>
-        <div className="flex items-center gap-2">
-          <button
-            onClick={() => setShowHeatmap(!showHeatmap)}
-            className={`px-3 py-2 rounded-xl text-sm font-medium transition-all duration-300 ${
-              showHeatmap ? 'bg-blue-100 text-blue-700 border border-blue-300' : 'morphic-btn-secondary'
-            }`}
-          >
-            {showHeatmap ? '🔥 Heatmap On' : 'Heatmap'}
-          </button>
-          <button
-            onClick={() => setSidebarOpen(!sidebarOpen)}
-            className="morphic-btn-secondary px-3 py-2 text-sm"
-          >
-            {sidebarOpen ? '◀ Events' : '▶ Events'}
-          </button>
+        <div className="flex gap-2">
+          <button className="morphic-btn-secondary px-3 py-2 text-sm" onClick={() => selectedEvent && loadInfrastructure(selectedEvent)} disabled={!selectedEvent || loadingInfrastructure}>↻ Refresh infrastructure</button>
+          <button className="morphic-btn-secondary px-3 py-2 text-sm" onClick={() => setSidebarOpen(value => !value)}>{sidebarOpen ? '◀ Events' : '▶ Events'}</button>
         </div>
       </div>
 
-      <div className="flex-1 flex gap-4 min-h-0">
-        {/* Event Selector Sidebar */}
-        {sidebarOpen && (
-          <div className="w-72 shrink-0 flex flex-col gap-3 overflow-y-auto animate-slide-in">
-            {/* Urgency Filter */}
-            <div className="morphic-card p-3">
-              <div className="flex items-center gap-1.5">
-                {[
-                  { key: 'all', label: 'All', color: 'bg-gray-500' },
-                  { key: 'High', label: 'High', color: 'bg-red-500' },
-                  { key: 'Medium', label: 'Med', color: 'bg-amber-500' },
-                  { key: 'Low', label: 'Low', color: 'bg-emerald-500' },
-                ].map(f => (
-                  <button
-                    key={f.key}
-                    onClick={() => setFilterUrgency(f.key)}
-                    className={`flex-1 py-1.5 px-2 rounded-lg text-xs font-medium transition-all duration-200 ${
-                      filterUrgency === f.key
-                        ? 'bg-blue-600 text-white shadow-sm'
-                        : 'hover:bg-gray-100 text-gray-600'
-                    }`}
-                  >
-                    <span className={`inline-block w-2 h-2 rounded-full ${f.color} mr-1`} />
-                    {f.label}
-                  </button>
-                ))}
-              </div>
+      <div className="flex flex-1 gap-4 min-h-[520px]">
+        {sidebarOpen && <aside className="w-72 shrink-0 morphic-card p-3 overflow-y-auto">
+          <h2 className="font-semibold mb-3" style={{ color: 'var(--text-color)' }}>Seismic events ({events.length})</h2>
+          {events.length === 0 ? <p className="text-sm opacity-60">No events with station coordinates are available.</p> : events.map(event => (
+            <button key={event.event_id} onClick={() => chooseEvent(event)} className={`w-full text-left p-3 mb-2 rounded-xl border transition ${selectedEvent?.event_id === event.event_id ? 'border-blue-500 bg-blue-50/70' : 'border-transparent hover:border-gray-300'}`}>
+              <div className="font-semibold text-sm truncate" style={{ color: 'var(--text-color)' }}>{event.event_name}</div>
+              <div className="text-xs opacity-70 mt-1" style={{ color: 'var(--text-color)' }}>{formatDate(event.detected_at || event.created_at)}</div>
+              <div className="text-xs opacity-70 mt-1" style={{ color: 'var(--text-color)' }}>{event.analysis?.affected_radius_km ?? '—'} km affected radius · {event.status}</div>
+              {event.analysis?.epicenter_latitude == null && <div className="text-xs text-amber-600 mt-1">Epicenter pending</div>}
+            </button>
+          ))}
+        </aside>}
+
+        <section className="flex-1 min-w-0 flex flex-col gap-3">
+          <div className="morphic-card overflow-hidden h-[440px]">
+            <MapContainer center={selectedEvent ? [selectedEvent.mapLatitude, selectedEvent.mapLongitude] : [30.3165, 78.0322]} zoom={selectedEvent ? 11 : 6} scrollWheelZoom className="h-full w-full">
+              <MapController event={selectedEvent} />
+              <TileLayer attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors' url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />
+              {events.map(event => <Marker key={event.event_id} position={[event.mapLatitude, event.mapLongitude]} icon={getEventIcon(selectedEvent?.event_id === event.event_id)} eventHandlers={{ click: () => chooseEvent(event) }}>
+                <Popup><strong>{event.event_name}</strong><br />{formatDate(event.detected_at || event.created_at)}<br />Status: {event.status}</Popup>
+              </Marker>)}
+              {selectedEvent?.analysis?.epicenter_latitude != null && selectedEvent?.analysis?.epicenter_longitude != null && affectedRadius > 0 && <Circle center={[selectedEvent.analysis.epicenter_latitude, selectedEvent.analysis.epicenter_longitude]} radius={affectedRadius * 1000} pathOptions={{ color: '#f97316', fillColor: '#f97316', fillOpacity: 0.10, weight: 2, dashArray: '7 5' }} />}
+              <MarkerClusterGroup chunkedLoading>
+                {visibleInfrastructure.map(item => <Marker key={item.osm_id} position={[item.latitude, item.longitude]} icon={getInfrastructureIcon(item)}>
+                  <Popup><div className="min-w-[190px]"><div className="font-bold mb-1">{INFRA_ICONS[item.amenity_type] || '📍'} {item.name || 'Unnamed structure'}</div><div className="text-sm">Type: {CATEGORY_LABELS[item.category] || item.category}</div><div className="text-xs opacity-70 mt-1">OpenStreetMap ID: {item.osm_id}</div></div></Popup>
+                </Marker>)}
+              </MarkerClusterGroup>
+            </MapContainer>
+          </div>
+
+          <div className="morphic-card p-4">
+            <div className="flex flex-wrap justify-between items-center gap-2 mb-3">
+              <div><h2 className="font-bold text-lg" style={{ color: 'var(--text-color)' }}>Critical infrastructure in affected area</h2><p className="text-xs opacity-65" style={{ color: 'var(--text-color)' }}>{selectedEvent ? `${selectedEvent.event_name} · Search radius: ${affectedRadius || '—'} km` : 'Select an event to search nearby infrastructure'}</p></div>
+              <span className="text-sm font-semibold px-3 py-1 rounded-full bg-blue-100 text-blue-800">{visibleInfrastructure.length} shown / {infrastructure.length} found</span>
             </div>
 
-            {/* Event List */}
-            <div className="flex-1 space-y-2 overflow-y-auto pr-1">
-              {earthquakeEvents.length === 0 ? (
-                <div className="text-center py-8">
-                  <p className="text-sm opacity-60" style={{ color: 'var(--text-color)' }}>No events available</p>
-                </div>
-              ) : (
-                earthquakeEvents.map((event, idx) => (
-                  <div key={event.event_id} className="animate-fade-in-up" style={{ animationDelay: `${idx * 0.05}s` }}>
-                    <EventSelectorItem
-                      event={event}
-                      isSelected={selectedEvent?.event_id === event.event_id}
-                      onClick={() => handleEventSelect(event)}
-                      isFrequent={frequentEvents.has(event.event_id)}
-                    />
+            {loadingInfrastructure && <div className="flex items-center gap-2 text-sm py-4"><span className="animate-spin h-4 w-4 border-2 border-blue-600 border-t-transparent rounded-full" /> Searching OpenStreetMap for nearby structures…</div>}
+            {!loadingInfrastructure && infrastructureError && <div className="text-sm text-amber-700 bg-amber-50 rounded-lg p-3">{infrastructureError}</div>}
+            {!loadingInfrastructure && !infrastructureError && infrastructure.length === 0 && <p className="text-sm opacity-65 py-3" style={{ color: 'var(--text-color)' }}>No mapped infrastructure was returned for this search area. This can mean OpenStreetMap has no mapped features there, not necessarily that no facilities exist.</p>}
+
+            {infrastructure.length > 0 && <>
+              <div className="flex flex-wrap gap-2 mb-3">
+                <button onClick={() => setCategoryFilter('all')} className={`text-xs px-3 py-1.5 rounded-full ${categoryFilter === 'all' ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-700'}`}>All ({infrastructure.length})</button>
+                {categories.map(category => <button key={category} onClick={() => setCategoryFilter(category)} className={`text-xs px-3 py-1.5 rounded-full ${categoryFilter === category ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-700'}`}>{CATEGORY_LABELS[category] || category} ({infrastructure.filter(item => item.category === category).length})</button>)}
+              </div>
+              <div className="max-h-80 overflow-y-auto divide-y divide-gray-200">
+                {visibleInfrastructure.map(item => <div key={item.osm_id} className="py-3 flex items-start gap-3">
+                  <div className="w-9 h-9 rounded-lg flex items-center justify-center shrink-0 text-lg" style={{ background: `${CATEGORY_COLORS[item.category] || '#64748b'}18` }}>{INFRA_ICONS[item.amenity_type] || INFRA_ICONS.default}</div>
+                  <div className="min-w-0 flex-1">
+                    <div className="font-semibold text-sm" style={{ color: 'var(--text-color)' }}>{item.name || 'Unnamed structure'}</div>
+                    <div className="text-xs opacity-65" style={{ color: 'var(--text-color)' }}>{CATEGORY_LABELS[item.category] || item.category} · {item.latitude.toFixed(5)}, {item.longitude.toFixed(5)}</div>
+                    {item.tags?.['addr:full'] && <div className="text-xs opacity-65">{item.tags['addr:full']}</div>}
                   </div>
-                ))
-              )}
-            </div>
-
-            {/* Stats Summary */}
-            <div className="morphic-card p-3">
-              <div className="grid grid-cols-3 gap-2 text-center">
-                <div>
-                  <p className="text-lg font-bold text-blue-600">{earthquakeEvents.length}</p>
-                  <p className="text-xs opacity-60" style={{ color: 'var(--text-color)' }}>Events</p>
-                </div>
-                <div>
-                  <p className="text-lg font-bold text-orange-600">{maxMagnitude}</p>
-                  <p className="text-xs opacity-60" style={{ color: 'var(--text-color)' }}>Max Mag</p>
-                </div>
-                <div>
-                  <p className="text-lg font-bold text-emerald-600">{avgDepth}</p>
-                  <p className="text-xs opacity-60" style={{ color: 'var(--text-color)' }}>Avg Depth</p>
-                </div>
+                  <a className="text-xs text-blue-600 hover:underline shrink-0" href={`https://www.openstreetmap.org/${item.osm_id}`} target="_blank" rel="noreferrer">OSM ↗</a>
+                </div>)}
               </div>
-            </div>
+            </>}
+            <p className="text-xs opacity-60 mt-3" style={{ color: 'var(--text-color)' }}>Source: OpenStreetMap via Overpass API. These are mapped facilities within the selected radius; proximity does not mean a structure is damaged or unsafe.</p>
           </div>
-        )}
-
-        {/* Map Container */}
-        <div className="flex-1 morphic-card overflow-hidden">
-          <MapContainer
-            center={selectedEvent ? [selectedEvent.latitude, selectedEvent.longitude] : [22.5726, 88.3639]}
-            zoom={selectedEvent ? 10 : 5}
-            scrollWheelZoom={true}
-            className="h-full w-full"
-          >
-            <MapController selectedEvent={selectedEvent} flyTo={flyTo} />
-
-            {/* Dark/satellite tile layer */}
-            <TileLayer
-              attribution='&copy; <a href="https://carto.com/">CARTO</a>'
-              url="https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png"
-            />
-
-            {/* Event Markers */}
-            {earthquakeEvents.map(event => (
-              <Marker
-                key={event.event_id}
-                position={[event.latitude, event.longitude]}
-                icon={getEventIcon(selectedEvent?.event_id === event.event_id)}
-                eventHandlers={{ click: () => handleEventSelect(event) }}
-              >
-                <Popup>
-                  <EnhancedPopup event={event} darkMode={darkMode} />
-                </Popup>
-              </Marker>
-            ))}
-
-            {/* Impact Radius Circles for selected event */}
-            {selectedEvent && (
-              <>
-                {selectedEvent.max_radius_adj && (
-                  <Circle
-                    center={[selectedEvent.latitude, selectedEvent.longitude]}
-                    radius={selectedEvent.max_radius_adj * 1000}
-                    pathOptions={{
-                      color: '#eab308',
-                      fillColor: '#eab308',
-                      fillOpacity: 0.08,
-                      weight: 2,
-                      dashArray: '8, 4',
-                    }}
-                  />
-                )}
-                {selectedEvent.empirical_radius_adj && (
-                  <Circle
-                    center={[selectedEvent.latitude, selectedEvent.longitude]}
-                    radius={selectedEvent.empirical_radius_adj * 1000}
-                    pathOptions={{
-                      color: '#f97316',
-                      fillColor: '#f97316',
-                      fillOpacity: 0.12,
-                      weight: 2,
-                    }}
-                  />
-                )}
-                {selectedEvent.strong_radius_adj && (
-                  <Circle
-                    center={[selectedEvent.latitude, selectedEvent.longitude]}
-                    radius={selectedEvent.strong_radius_adj * 1000}
-                    pathOptions={{
-                      color: '#ef4444',
-                      fillColor: '#ef4444',
-                      fillOpacity: 0.15,
-                      weight: 3,
-                    }}
-                  />
-                )}
-              </>
-            )}
-
-            {/* Critical Infrastructure Markers */}
-            <MarkerClusterGroup
-              chunkedLoading
-              iconCreateFunction={(cluster) => {
-                const count = cluster.getChildCount()
-                let colorClass = 'cluster-small'
-                if (count > 100) colorClass = 'cluster-large'
-                else if (count > 50) colorClass = 'cluster-medium'
-                return L.divIcon({
-                  html: `<div class="custom-cluster-icon ${colorClass}">${count}</div>`,
-                  className: 'custom-cluster-wrapper',
-                  iconSize: L.point(40, 40),
-                })
-              }}
-            >
-              {allInfrastructures.map(infra => (
-                <Marker
-                  key={infra.key}
-                  position={[infra.latitude, infra.longitude]}
-                  icon={getInfrastructureIcon(infra.urgency, infra.amenity_type)}
-                >
-                  <Popup>
-                    <div className="min-w-[200px] p-1">
-                      <div className="flex items-center gap-2 mb-2">
-                        <span className="text-xl">{INFRA_ICONS[infra.amenity_type] || INFRA_ICONS.default}</span>
-                        <h3 className="font-bold" style={{ color: darkMode ? '#f1f5f9' : '#111827' }}>{infra.name || 'Infrastructure'}</h3>
-                      </div>
-                    <div className="space-y-1 text-sm">
-                        <div className="flex justify-between">
-                          <span style={{ color: darkMode ? '#94a3b8' : '#6b7280' }}>Category</span>
-                          <span className="font-medium" style={{ color: darkMode ? '#f1f5f9' : '#111827' }}>{infra.category || 'N/A'}</span>
-                        </div>
-                        <div className="flex justify-between">
-                          <span style={{ color: darkMode ? '#94a3b8' : '#6b7280' }}>Event</span>
-                          <span className="font-medium" style={{ color: darkMode ? '#f1f5f9' : '#111827' }}>{infra.event.event_name}</span>
-                        </div>
-                        <div className="flex justify-between">
-                          <span style={{ color: darkMode ? '#94a3b8' : '#6b7280' }}>Urgency</span>
-                          <span className={`font-semibold ${
-                            infra.urgency === 'High' ? 'text-red-600' :
-                            infra.urgency === 'Medium' ? 'text-amber-600' : 'text-emerald-600'
-                          }`}>{infra.urgency}</span>
-                        </div>
-                        <div className="flex justify-between">
-                          <span style={{ color: darkMode ? '#94a3b8' : '#6b7280' }}>Distance</span>
-                          <span className="font-semibold" style={{ color: darkMode ? '#f1f5f9' : '#111827' }}>{infra.distance_km || infra.distance_meters ? (infra.distance_km || (infra.distance_meters / 1000).toFixed(1)) + ' km' : 'N/A'}</span>
-                        </div>
-                      </div>
-                    </div>
-                  </Popup>
-                </Marker>
-              ))}
-            </MarkerClusterGroup>
-          </MapContainer>
-
-          {/* Map Legend */}
-          <div className="map-legend">
-            <h4 className="map-legend-title">Impact Radius</h4>
-            <div className="space-y-1.5">
-              <div className="map-legend-item">
-                <span className="w-3 h-0.5 rounded bg-red-500" />
-                <span>Strong ({selectedEvent?.strong_radius_adj || 0} km)</span>
-              </div>
-              <div className="map-legend-item">
-                <span className="w-3 h-0.5 rounded bg-orange-500" />
-                <span>Moderate ({selectedEvent?.empirical_radius_adj || 0} km)</span>
-              </div>
-              <div className="map-legend-item">
-                <span className="w-3 h-0.5 rounded bg-yellow-500" style={{ borderStyle: 'dashed' }} />
-                <span>Max ({selectedEvent?.max_radius_adj || 0} km)</span>
-              </div>
-            </div>
-            <div className="border-t border-gray-200 mt-2 pt-2">
-              <h4 className="map-legend-title">Infrastructure</h4>
-              <div className="flex items-center gap-2 text-xs">
-                <span className="w-3 h-3 rounded-full bg-red-500" /> High
-                <span className="w-3 h-3 rounded-full bg-amber-500" /> Med
-                <span className="w-3 h-3 rounded-full bg-emerald-500" /> Low
-              </div>
-            </div>
-          </div>
-        </div>
+        </section>
       </div>
     </div>
   )
