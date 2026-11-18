@@ -156,6 +156,9 @@ function ImpactMap({ darkMode = false }) {
       if (!response.ok) throw new Error(payload.detail || `OpenStreetMap lookup failed (${response.status})`)
       setInfrastructure(payload.infrastructure || [])
       setRadiusKm(payload.radius_km ?? radius)
+      if (!payload.infrastructure?.length && payload.status !== 'pending') {
+        setInfrastructureError('No mapped facilities were returned. OpenStreetMap may be temporarily busy or have limited coverage here. Retry in a moment.')
+      }
       setCenterSource(payload.center_source || '')
       if (payload.status === 'pending') {
         setInfrastructureError(payload.reason || 'Location information is pending for this event.')
@@ -164,7 +167,7 @@ function ImpactMap({ darkMode = false }) {
       }
     } catch (error) {
       setCenterSource('')
-      setInfrastructureError(`${error.message || 'Unable to retrieve infrastructure'}. The lookup uses the OpenStreetMap Overpass API; try again in a moment if the service is busy.`)
+      setInfrastructureError(`${error.message || 'Unable to retrieve infrastructure'}. The lookup uses OpenStreetMap Overpass servers; try again in a moment if they are busy.`)
     } finally {
       setLoadingInfrastructure(false)
     }

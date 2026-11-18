@@ -171,33 +171,19 @@ async def system_logs(limit: int = Query(100,ge=1,le=500)):
     return {'logs':[dict(r) for r in rows]}
 
 async def fetch_infrastructure(event: dict, radius_km: float | None, center: tuple[float, float] | None = None):
-    # Fetch mapped facilities around a scientifically-unverified search center.
-    # The caller labels whether the center is an estimated epicenter or a station.
+    """Fetch nearby OSM facilities with bounded latency and cache-first fallback."""
     analysis = json_value(event.get('analysis')) or {}
     lat = center[0] if center else analysis.get('epicenter_latitude')
     lon = center[1] if center else analysis.get('epicenter_longitude')
     if lat is None or lon is None:
         return []
-
-    # A default proximity-search radius keeps the map useful when no
-    # scientifically estimated impact radius is available. It is NOT
-    # presented as an earthquake damage/impact radius.
     if radius_km is None:
         radius_km = analysis.get('affected_radius_km')
     if radius_km is None:
         radius_km = float(os.getenv('INFRASTRUCTURE_DEFAULT_RADIUS_KM', '5'))
-
     radius_km = min(max(float(radius_km), 0.5), 50.0)
     radius_m = int(radius_km * 1000)
     lat, lon = float(lat), float(lon)
-
-    async with db.acquire() as conn:
-        cached = await conn.fetch('''
-          SELECT * FROM infrastructure_cache
-          WHERE abs(latitude-$1)<=$2/111000.0
-          AND abs(longitude-$3)<=$2/(111000.0*greatest(cos(radians($1)),0.2))
-          AND fetched_at > NOW() - INTERVAL '7 days'
-        ''', lat, radius_m, lon)
 
     import math
     def within_radius(item_lat, item_lon):
@@ -207,18 +193,33 @@ async def fetch_infrastructure(event: dict, radius_km: float | None, center: tup
         a = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
         return 6371.0 * 2 * math.asin(math.sqrt(min(1.0, a))) <= radius_km
 
-    cached_items = [{**dict(row), 'tags': json_value(row['tags'])}
-                    for row in cached if within_radius(row['latitude'], row['longitude'])]
+    async with db.acquire() as conn:
+        fresh_rows = await conn.fetch("""
+          SELECT * FROM infrastructure_cache
+          WHERE abs(latitude-$1)<=$2/111000.0
+          AND abs(longitude-$3)<=$2/(111000.0*greatest(cos(radians($1)),0.2))
+          AND fetched_at > NOW() - INTERVAL '7 days'
+        """, lat, radius_m, lon)
+        stale_rows = await conn.fetch("""
+          SELECT * FROM infrastructure_cache
+          WHERE abs(latitude-$1)<=$2/111000.0
+          AND abs(longitude-$3)<=$2/(111000.0*greatest(cos(radians($1)),0.2))
+        """, lat, radius_m, lon)
 
-    query = f'''[out:json][timeout:40];
+    def rows_to_items(rows):
+        return [{**dict(row), 'tags': json_value(row['tags'])}
+                for row in rows if within_radius(row['latitude'], row['longitude'])]
+    fresh_items = rows_to_items(fresh_rows)
+    stale_items = rows_to_items(stale_rows)
+
+    # Keep the query smaller: broad multi-selector Overpass requests often time out.
+    query = f'''[out:json][timeout:12];
     (
-      nwr(around:{radius_m},{lat},{lon})[amenity~"^(hospital|clinic|doctors|dentist|school|college|university|kindergarten|police|fire_station|shelter|ambulance_station)$"];
+      nwr(around:{radius_m},{lat},{lon})[amenity~"^(hospital|clinic|doctors|school|college|university|kindergarten|police|fire_station|shelter|ambulance_station)$"];
       nwr(around:{radius_m},{lat},{lon})[emergency~"^(ambulance_station|fire_station|disaster_response|shelter)$"];
       nwr(around:{radius_m},{lat},{lon})[healthcare];
       nwr(around:{radius_m},{lat},{lon})[power~"^(plant|substation|generator)$"];
       nwr(around:{radius_m},{lat},{lon})[man_made~"^(water_works|wastewater_plant|water_tower)$"];
-      nwr(around:{radius_m},{lat},{lon})[telecom~"^(exchange|data_centre)$"];
-      nwr(around:{radius_m},{lat},{lon})[tower~"^(communication|communication.*)$"];
       way(around:{radius_m},{lat},{lon})[bridge];
       way(around:{radius_m},{lat},{lon})[highway~"^(motorway|trunk|primary|secondary)$"];
       nwr(around:{radius_m},{lat},{lon})[railway~"^(station|halt)$"];
@@ -226,34 +227,50 @@ async def fetch_infrastructure(event: dict, radius_km: float | None, center: tup
     );
     out center tags;'''
 
-    elements = None
-    last_error = None
-    for endpoint in (
+    endpoints = (
         'https://overpass-api.de/api/interpreter',
         'https://overpass.kumi.systems/api/interpreter',
         'https://overpass.private.coffee/api/interpreter',
-    ):
-        try:
-            async with httpx.AsyncClient(timeout=50, headers={
-                'User-Agent': 'SeismoLink-Educational/1.0 (critical infrastructure map)'
-            }) as client:
-                response = await client.post(endpoint, data={'data': query})
-                response.raise_for_status()
-                elements = response.json().get('elements', [])
-                break
-        except Exception as exc:
-            last_error = exc
+    )
+    async def request_endpoint(endpoint: str):
+        timeout = httpx.Timeout(connect=4.0, read=16.0, write=8.0, pool=4.0)
+        async with httpx.AsyncClient(timeout=timeout, headers={
+            'User-Agent': 'SeismoLink/1.0 (educational seismic infrastructure mapping)'
+        }) as client:
+            response = await client.post(endpoint, data={'data': query})
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, dict) or not isinstance(payload.get('elements', []), list):
+                raise ValueError('Overpass returned an invalid response')
+            return payload.get('elements', [])
 
-    if elements is None:
-        if cached_items:
-            return cached_items
-        raise HTTPException(502, f'OpenStreetMap Overpass lookup failed on the available servers: {last_error}')
+    tasks = [asyncio.create_task(request_endpoint(url)) for url in endpoints]
+    elements = None
+    try:
+        pending = set(tasks)
+        while pending and elements is None:
+            done, pending = await asyncio.wait(pending, timeout=17.0, return_when=asyncio.FIRST_COMPLETED)
+            if not done:
+                break
+            for task in done:
+                try:
+                    elements = task.result()
+                    break
+                except Exception:
+                    continue
+        if elements is None:
+            return fresh_items or stale_items or []
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     items = []
     for el in elements:
         tags = el.get('tags') or {}
-        center = el.get('center', el)
-        if center.get('lat') is None or center.get('lon') is None:
+        point = el.get('center', el)
+        if point.get('lat') is None or point.get('lon') is None:
             continue
         amenity = tags.get('amenity')
         emergency = tags.get('emergency')
@@ -264,8 +281,7 @@ async def fetch_infrastructure(event: dict, radius_km: float | None, center: tup
         railway = tags.get('railway')
         aeroway = tags.get('aeroway')
         healthcare = tags.get('healthcare')
-
-        if amenity in ('hospital', 'clinic', 'doctors', 'dentist') or healthcare:
+        if amenity in ('hospital', 'clinic', 'doctors') or healthcare:
             category = 'healthcare'
         elif amenity in ('school', 'college', 'university', 'kindergarten'):
             category = 'education'
@@ -289,32 +305,28 @@ async def fetch_infrastructure(event: dict, radius_km: float | None, center: tup
             category = 'airport'
         else:
             category = 'infrastructure'
-
         osm_type = el.get('type', 'node')
         items.append({
             'osm_id': f"{osm_type}/{el['id']}",
             'name': tags.get('name') or f"Unnamed {category.replace('_', ' ')}",
             'category': category,
             'amenity_type': amenity or emergency or power or man_made or telecom or healthcare or railway or aeroway or ('bridge' if 'bridge' in tags else highway) or 'infrastructure',
-            'latitude': float(center['lat']),
-            'longitude': float(center['lon']),
+            'latitude': float(point['lat']),
+            'longitude': float(point['lon']),
             'tags': tags,
         })
-
     if items:
         async with db.acquire() as conn:
             for item in items:
-                await conn.execute('''
+                await conn.execute("""
                     INSERT INTO infrastructure_cache(osm_id,name,category,amenity_type,latitude,longitude,tags)
                     VALUES($1,$2,$3,$4,$5,$6,$7::jsonb)
                     ON CONFLICT(osm_id) DO UPDATE SET name=EXCLUDED.name,category=EXCLUDED.category,
                     amenity_type=EXCLUDED.amenity_type,latitude=EXCLUDED.latitude,longitude=EXCLUDED.longitude,
                     tags=EXCLUDED.tags,fetched_at=NOW()
-                ''', item['osm_id'], item['name'], item['category'], item['amenity_type'],
+                """, item['osm_id'], item['name'], item['category'], item['amenity_type'],
                      item['latitude'], item['longitude'], json.dumps(item['tags']))
-    # A successful empty Overpass response should not discard previously cached
-    # mapped features for this area.
-    return items if items else cached_items
+    return items if items else fresh_items or stale_items
 
 
 @api.get('/api/v1/events/{event_id}/infrastructure')
